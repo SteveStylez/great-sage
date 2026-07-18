@@ -1,0 +1,8 @@
+# Agent bus and architect use HTTP against the Sage Bridge
+requests>=2.31.0
+
+# Embedding pipeline writes vectors to a local ChromaDB store
+chromadb>=0.4.0
+
+# The rest of the code uses only the Python standard library.
+# The Cloudflare pieces shell out to the `wrangler` CLI, installed separately.
