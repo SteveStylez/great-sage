@@ -6,12 +6,13 @@ This is a portfolio slice, not the whole machine. Business logic, personal conte
 
 ## What this is
 
-Four subsystems, wired in a line:
+Five subsystems, wired in a line:
 
 1. **Agent bus** gives every daemon a shared address book and a message envelope format, so components coordinate without importing each other.
 2. **Dispatch** hands work to the right executor: background coding riders, a video queue, or a content generator, and tracks each job to completion.
 3. **Daemons** run continuously and are watched by a health layer whose whole job is to prove that other daemons produce output, not just stay alive.
 4. **Semantic recall** turns a personal archive of conversations into a searchable index, so any agent can ask "what did I decide about X" and get grounded context back.
+5. **Session persistence** writes a warm handoff when a session ends and reads it back when the next one boots, so stateless CLI sessions resume mid-flight work instead of starting cold.
 
 ```mermaid
 flowchart TD
@@ -38,12 +39,21 @@ flowchart TD
         QUERY[Retrieval + Scoring]
     end
 
+    subgraph Persist["Session Persistence"]
+        DIABLO[DIABLO: write handoff]
+        STATE[(SESSION_STATE.md)]
+        ARISE[ARISE: boot + verify]
+        DIABLO --> STATE --> ARISE
+    end
+
     Bus --> Dispatch
     Dispatch --> Daemons
     Daemons -->|health signals| Bus
     Recall -->|grounded context| Dispatch
     HEALTH -->|imports| Bus
     ARCH -->|3-model audit| Dispatch
+    ARISE -->|resumed state| Dispatch
+    ARISE -->|live counts| Bus
 ```
 
 ## The pieces
@@ -81,6 +91,15 @@ A pipeline that took a personal archive out of one Cloudflare database (D1, name
 - **`src/build_missing_by_key.py`** and **`src/chunk_exec_bykey.py`** are the repair pair. An earlier migration matched rows by primary key and silently dropped anything whose ids collided. These identify the genuinely missing chunks by content key (conversation id plus chunk index, not row id), rebuild idempotent `INSERT OR IGNORE` statements, and execute them in chunks with per-statement retry so one malformed row cannot sink a batch.
 - **`src/codex_retrieval.py`** is the query side. It scores candidate messages by keyword match and recency (a 365-day half-life), pulls the best few turns per conversation, and returns a grounded context block an agent can act on.
 
+### Session persistence: ARISE and DIABLO
+
+A CLI agent session is stateless. When it ends, everything it was holding is gone: the half-finished migration, the decision it just made, the deadline it was tracking, the file it drafted but had not sent. The next session starts from zero and has to rediscover all of it, or worse, redo work that was already done. This pair of rituals closes that loop and turns the end of a session into a checkpoint instead of a loss.
+
+- **DIABLO** is the close ritual. Before a session ends, it writes a warm handoff to `SESSION_STATE.md`: what got done, what is still in flight and should be resumed first, what actions only the human operator can take, and the next priorities in order. The structure is in **`src/SESSION_STATE.template.md`** (fictional placeholder content, safe to read).
+- **ARISE** is the boot ritual, **`src/arise_boot.sh`**. A new session runs it before doing anything else. It reads `SESSION_STATE.md` for instant context, then verifies that context against live state so the session acts on what is true now, not on a stale snapshot: it counts open tasks and queue depth from the database, pulls standing directives, lists pending work, checks daemon health, and reattaches the operator's identity. A session that boots this way resumes. A session without it restarts cold.
+
+The verification step matters. The handoff file is fast but can be stale by the time the next session reads it, so ARISE treats it as a starting point and reconciles it against the live database before trusting any number in it. If the handoff file is missing, that is a cold boot, and the script reconstructs state from the database instead. The boot script here is the real one, reduced to structure and scrubbed of secrets. Some of the daemons it wires together are in this repository; others are part of the larger private system.
+
 ## Design rules the code follows
 
 - **Output, not uptime.** A daemon that runs but produces nothing is a failure. The health layer checks for produced output, not a live process.
@@ -104,7 +123,8 @@ Most components are meant to run as launchd agents on macOS or as long-lived pro
 ## Scope and honesty
 
 - This is a subset. The private orchestration loop, the business logic, and the operator's actual data are not in this repository.
-- The names (Great Sage, Goblin Riders, Shion, Efreet) come from the running system. They are labels, not products.
+- The names (Great Sage, Goblin Riders, Shion, Efreet, ARISE, DIABLO) come from the running system. They are labels, not products.
+- `SESSION_STATE.template.md` is fictional placeholder content. No real session state is in this repository.
 - Secrets are read from the environment. The example bridge URL is a placeholder. Point the variables at your own infrastructure to run it.
 
 ## License
