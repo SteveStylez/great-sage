@@ -262,17 +262,16 @@ def _audit_ciel(description: str, diff: str) -> dict:
         match = re.search(r'\{.*?"verdict".*?\}', output, re.DOTALL)
         if match:
             data = json.loads(match.group())
-            return {"model": "ciel/qwen3", "verdict": data.get("verdict", "APPROVE"), "reason": data.get("reason", "")}
-        # If no JSON, treat as approval if no error keywords
-        reject_keywords = ["reject", "error", "bug", "dangerous", "unsafe"]
-        verdict = "REJECT" if any(k in output.lower() for k in reject_keywords) else "APPROVE"
-        return {"model": "ciel/qwen3", "verdict": verdict, "reason": output[:300]}
+            return {"model": "ciel/qwen3", "verdict": data.get("verdict", "SKIPPED"), "reason": data.get("reason", "")}
+        # No parseable JSON verdict → SKIPPED. An unreadable audit is NOT an approval
+        # (previous keyword-guess flipped "no errors found" to REJECT and let garbage APPROVE).
+        return {"model": "ciel/qwen3", "verdict": "SKIPPED", "reason": "no parseable verdict: " + output[:280]}
     except FileNotFoundError:
-        log.warning("ollama not available — Ciel audit skipped, auto-APPROVE")
-        return {"model": "ciel/qwen3", "verdict": "APPROVE", "reason": "ollama not available — skipped"}
+        log.warning("ollama not available — Ciel audit SKIPPED (a skipped gate is not an approval)")
+        return {"model": "ciel/qwen3", "verdict": "SKIPPED", "reason": "ollama not available — skipped"}
     except Exception as e:
         log.warning("Ciel audit error: %s", e)
-        return {"model": "ciel/qwen3", "verdict": "APPROVE", "reason": f"audit error: {e}"}
+        return {"model": "ciel/qwen3", "verdict": "SKIPPED", "reason": f"audit error: {e}"}
 
 
 def _audit_claude(description: str, diff: str) -> dict:
@@ -282,7 +281,7 @@ def _audit_claude(description: str, diff: str) -> dict:
     """
     if not CLAUDE_API_KEY:
         log.warning("no ANTHROPIC_API_KEY — Claude audit skipped")
-        return {"model": "claude", "verdict": "APPROVE", "reason": "no API key — skipped"}
+        return {"model": "claude", "verdict": "SKIPPED", "reason": "no API key — skipped"}
     try:
         prompt = (
             f"You are auditing a proposed improvement to a Python daemon in a personal AI operating system.\n\n"
@@ -315,16 +314,16 @@ def _audit_claude(description: str, diff: str) -> dict:
                 data = json.loads(match.group())
                 return {
                     "model": "claude",
-                    "verdict": data.get("verdict", "APPROVE"),
+                    "verdict": data.get("verdict", "SKIPPED"),
                     "confidence": data.get("confidence", 80),
                     "reason": data.get("reason", ""),
                 }
-            return {"model": "claude", "verdict": "APPROVE", "reason": content[:300]}
+            return {"model": "claude", "verdict": "SKIPPED", "reason": "no parseable verdict: " + content[:280]}
         log.warning("Claude API %s: %s", r.status_code, r.text[:200])
-        return {"model": "claude", "verdict": "APPROVE", "reason": f"API error {r.status_code}"}
+        return {"model": "claude", "verdict": "SKIPPED", "reason": f"API error {r.status_code}"}
     except Exception as e:
         log.warning("Claude audit error: %s", e)
-        return {"model": "claude", "verdict": "APPROVE", "reason": f"error: {e}"}
+        return {"model": "claude", "verdict": "SKIPPED", "reason": f"error: {e}"}
 
 
 def _audit_gpt4(description: str, diff: str) -> dict:
@@ -334,7 +333,7 @@ def _audit_gpt4(description: str, diff: str) -> dict:
     """
     if not OPENAI_API_KEY:
         log.warning("no OPENAI_API_KEY — GPT-4 audit skipped")
-        return {"model": "gpt4", "verdict": "APPROVE", "reason": "no API key — skipped"}
+        return {"model": "gpt4", "verdict": "SKIPPED", "reason": "no API key — skipped"}
     try:
         prompt = (
             f"Audit this proposed Python daemon improvement for bugs, security issues, "
@@ -359,15 +358,15 @@ def _audit_gpt4(description: str, diff: str) -> dict:
             data = json.loads(content)
             return {
                 "model": "gpt4",
-                "verdict": data.get("verdict", "APPROVE"),
+                "verdict": data.get("verdict", "SKIPPED"),
                 "confidence": data.get("confidence", 80),
                 "reason": data.get("reason", ""),
             }
         log.warning("GPT-4 API %s: %s", r.status_code, r.text[:200])
-        return {"model": "gpt4", "verdict": "APPROVE", "reason": f"API error {r.status_code}"}
+        return {"model": "gpt4", "verdict": "SKIPPED", "reason": f"API error {r.status_code}"}
     except Exception as e:
         log.warning("GPT-4 audit error: %s", e)
-        return {"model": "gpt4", "verdict": "APPROVE", "reason": f"error: {e}"}
+        return {"model": "gpt4", "verdict": "SKIPPED", "reason": f"error: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -391,15 +390,19 @@ def _submit_proposal(pattern: dict):
     audits = [audit_ciel, audit_claude, audit_gpt4]
     approvals = sum(1 for a in audits if a["verdict"] == "APPROVE")
     rejections = sum(1 for a in audits if a["verdict"] == "REJECT")
+    skipped    = sum(1 for a in audits if a["verdict"] == "SKIPPED")
 
-    # Need 2/3 models to approve (one rejection is a flag, not a kill)
-    # Need 3/3 rejections to hard-kill the proposal
+    # Fail CLOSED: a proposal advances to Steve ONLY with a real majority approval.
+    # Skipped audits (missing model / key / HTTP error) count as NOT approved — never a pass.
     if rejections >= 2:
         status = "rejected_by_audit"
         log.info("proposal rejected by audit (%d/3 rejections)", rejections)
-    else:
+    elif approvals >= 2:
         status = "pending_steve"
-        log.info("proposal passed audit (%d/3 approvals) — awaiting Steve sign-off", approvals)
+        log.info("proposal passed audit (%d/3 approvals, %d skipped) — awaiting Steve sign-off", approvals, skipped)
+    else:
+        status = "blocked_insufficient_audit"
+        log.warning("proposal BLOCKED: only %d/3 approvals (%d skipped, %d rejected) — audit gate did not pass", approvals, skipped, rejections)
 
     # Write to D1
     _bridge(
@@ -436,7 +439,7 @@ def _submit_proposal(pattern: dict):
             f"Daemon: `{daemon}`\n"
             f"Pattern: `{pattern['pattern_type']}`\n"
             f"Occurred: {pattern['count']}x\n"
-            f"Audit: {approvals}/3 models approved\n"
+            f"Audit: {approvals}/3 approved, {skipped} skipped, {rejections} rejected\n"
             f"Proposal ID: `{proposal_id[:8]}`\n\n"
             f"Description: {description[:300]}\n\n"
             f"_Reply APPROVE {proposal_id[:8]} or REJECT {proposal_id[:8]} to decide._"

@@ -338,8 +338,10 @@ class AgentBus:
         """
         params = [self.agent_id, now, str(limit)]
 
+        from_local = False
         rows = _bridge(sql, params)
         if rows is None:
+            from_local = True
             try:
                 db = _local_db()
                 cur = db.execute(
@@ -354,15 +356,27 @@ class AgentBus:
         if not rows:
             return []
 
-        # Mark delivered
-        ids = [str(r["id"]) for r in rows]
-        id_list = ",".join(ids)
-        mark_sql = f"""
-            UPDATE gs_agent_messages
-            SET status='delivered', delivered_at=?
-            WHERE id IN ({id_list})
-        """
-        _bridge(mark_sql, [now])
+        # Mark delivered — on the SAME store we just read from.
+        # (Previously this always hit the bridge; in local-fallback mode the bridge is down,
+        #  so local rows were never marked delivered and got redelivered on every poll forever.)
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)  # parametrized: no f-string id injection
+        if from_local:
+            try:
+                db = _local_db()
+                db.execute(
+                    f"UPDATE agent_messages SET status='delivered', delivered_at=? WHERE id IN ({placeholders})",
+                    [now, *ids],
+                )
+                db.commit()
+                db.close()
+            except Exception as e:
+                log.warning("[%s] local mark-delivered failed: %s", self.agent_id, e)
+        else:
+            _bridge(
+                f"UPDATE gs_agent_messages SET status='delivered', delivered_at=? WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
 
         # Parse payloads
         result = []

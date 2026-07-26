@@ -243,7 +243,7 @@ CHROMADB_PATH="$HOME/workspace/data/gs_memory_chromadb"
 if [ -d "$CHROMADB_PATH" ]; then
   echo "--- CHROMADB MEMORY (top research relevant to pending tasks) ---"
   # Query ChromaDB for context on current pending task titles
-  PENDING_TITLES=$(cat "$TMPDIR_ARISE/tasks.json" 2>/dev/null | python3 -c "
+  PENDING_TITLES=$(cat "$TMPDIR_ARISE/pending.json" 2>/dev/null | python3 -c "
 import sys, json
 try:
     rows = json.load(sys.stdin).get('results',[])[:3]

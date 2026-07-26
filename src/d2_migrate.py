@@ -89,7 +89,9 @@ def migrate_table(table):
 
     while offset < total:
         # Fetch a page
-        fetch_sql = f"SELECT * FROM {table} LIMIT {PAGE_SIZE} OFFSET {offset}"
+        # ORDER BY rowid: without a stable order, LIMIT/OFFSET can skip or repeat rows
+        # across pages (silent data loss — the exact failure the repair scripts exist to fix).
+        fetch_sql = f"SELECT * FROM {table} ORDER BY rowid LIMIT {PAGE_SIZE} OFFSET {offset}"
         page_rows = run_wrangler("sage-prism", fetch_sql)
 
         if not page_rows:

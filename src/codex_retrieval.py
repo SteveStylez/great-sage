@@ -8,12 +8,12 @@ Usage (CLI):
     python3 codex_retrieval.py "UCSD coursework" --domain academic --top 3
 
 Usage (as module):
-    from codex_retrieval import os
-import query_codex
+    from codex_retrieval import query_codex
     context_block = query_codex("what did I say about OBS streaming", top_k=3)
     # inject context_block into a Claude prompt
 """
 
+import os
 import json
 import re
 import sys
