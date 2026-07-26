@@ -11,7 +11,7 @@ Pipeline:
   Event bus (gs_bus_events) → pattern detection → proposal generation →
   Stage 1: Ciel/Qwen3 local audit →
   Stage 2: Claude API headless audit →
-  Stage 3: GPT-4 independent audit →
+  Stage 3: GPT-4o-mini independent audit →
   All 3 pass → APPROVED → Telegram to Steve → Steve signs off → staged for deploy
 
 Steve's constraint: code modification is GATED. The Architect proposes, three
@@ -328,12 +328,12 @@ def _audit_claude(description: str, diff: str) -> dict:
 
 def _audit_gpt4(description: str, diff: str) -> dict:
     """
-    Stage 3: GPT-4 independent audit.
+    Stage 3: GPT-4o-mini independent audit.
     Independent reasoning chain — different blind spots from Claude.
     """
     if not OPENAI_API_KEY:
-        log.warning("no OPENAI_API_KEY — GPT-4 audit skipped")
-        return {"model": "gpt4", "verdict": "SKIPPED", "reason": "no API key — skipped"}
+        log.warning("no OPENAI_API_KEY — GPT-4o-mini audit skipped")
+        return {"model": "gpt4o-mini", "verdict": "SKIPPED", "reason": "no API key — skipped"}
     try:
         prompt = (
             f"Audit this proposed Python daemon improvement for bugs, security issues, "
@@ -357,16 +357,16 @@ def _audit_gpt4(description: str, diff: str) -> dict:
             content = r.json()["choices"][0]["message"]["content"]
             data = json.loads(content)
             return {
-                "model": "gpt4",
+                "model": "gpt4o-mini",
                 "verdict": data.get("verdict", "SKIPPED"),
                 "confidence": data.get("confidence", 80),
                 "reason": data.get("reason", ""),
             }
-        log.warning("GPT-4 API %s: %s", r.status_code, r.text[:200])
-        return {"model": "gpt4", "verdict": "SKIPPED", "reason": f"API error {r.status_code}"}
+        log.warning("GPT-4o-mini API %s: %s", r.status_code, r.text[:200])
+        return {"model": "gpt4o-mini", "verdict": "SKIPPED", "reason": f"API error {r.status_code}"}
     except Exception as e:
-        log.warning("GPT-4 audit error: %s", e)
-        return {"model": "gpt4", "verdict": "SKIPPED", "reason": f"error: {e}"}
+        log.warning("GPT-4o-mini audit error: %s", e)
+        return {"model": "gpt4o-mini", "verdict": "SKIPPED", "reason": f"error: {e}"}
 
 
 # ---------------------------------------------------------------------------

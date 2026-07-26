@@ -235,10 +235,13 @@ def check_timeouts(max_minutes: int = 30, notify: bool = True) -> list:
     timed_out = []
     for row in stale:
         rider_id = row["id"]
+        # AND status='running' guards against a race where the rider completed
+        # between the SELECT above and this UPDATE — without it, a just-finished
+        # rider could get stomped back to 'timeout' after it already reported success.
         update_sql = (
             "UPDATE goblin_dispatch "
             "SET status='timeout', completed_at=?, result_summary=? "
-            "WHERE id=?"
+            "WHERE id=? AND status='running'"
         )
         _bridge_query(
             update_sql,
@@ -272,11 +275,19 @@ def get_session_report(session_id: Optional[str] = None) -> str:
         sql = "SELECT * FROM goblin_dispatch WHERE session_id=? ORDER BY id"
         result = _bridge_query(sql, [session_id])
     else:
+        # started_at is always written via _now_utc() as "%Y-%m-%dT%H:%M:%SZ" (ISO,
+        # 'T'-separated). SQLite's datetime('now') returns "%Y-%m-%d %H:%M:%S" (space-
+        # separated). Comparing those two formats lexicographically is unreliable —
+        # ' ' (0x20) sorts before 'T' (0x54), so almost every stored timestamp compares
+        # as "greater than" the SQLite cutoff regardless of actual date, turning the
+        # intended 24h window into roughly 48h. Compute the cutoff in the SAME format
+        # the column is actually written in and compare like-for-like.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         sql = (
             "SELECT * FROM goblin_dispatch "
-            "WHERE started_at >= datetime('now','-1 day') ORDER BY id DESC LIMIT 20"
+            "WHERE started_at >= ? ORDER BY id DESC LIMIT 20"
         )
-        result = _bridge_query(sql)
+        result = _bridge_query(sql, [cutoff])
 
     rows = result if isinstance(result, list) else result.get("results", [])
 

@@ -3,7 +3,6 @@
 
 import subprocess
 import json
-import sys
 import os
 
 TABLES_TO_MIGRATE = [
@@ -59,6 +58,12 @@ def escape_sql_value(val):
     """Escape a value for SQL insertion."""
     if val is None:
         return "NULL"
+    # bool must be checked before int: in Python bool is an int subclass, so
+    # isinstance(True, int) is True. Without this check, True/False fell through
+    # to str(val) -> "True"/"False", an unquoted, invalid SQL literal that would
+    # break the INSERT rather than emitting a proper 1/0.
+    if isinstance(val, bool):
+        return "1" if val else "0"
     if isinstance(val, (int, float)):
         return str(val)
     # String: escape single quotes

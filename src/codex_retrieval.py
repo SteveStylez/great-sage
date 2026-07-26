@@ -11,6 +11,19 @@ Usage (as module):
     from codex_retrieval import query_codex
     context_block = query_codex("what did I say about OBS streaming", top_k=3)
     # inject context_block into a Claude prompt
+
+NOTE — two independent retrieval paths, not one pipeline:
+    This module does keyword/LIKE-based retrieval straight against D1's
+    the_codex_conversations table (title pre-filter + token scoring, no vectors).
+    codex_to_chromadb.py is a SEPARATE pipeline: it embeds the same corpus (plus
+    transcripts/emails/browsing/etc.) into a local ChromaDB collection via OpenAI
+    embeddings for semantic/vector search. The two do NOT talk to each other —
+    this file never queries the Chroma collection codex_to_chromadb.py builds.
+    They are alternative retrieval strategies (fast/free keyword match here vs.
+    semantic recall there) kept separate rather than wired into a single hybrid
+    retriever, so pick the one that matches the query: exact-term recall → this
+    module; conceptual/semantic recall → query ChromaDB's "gs_codex" collection
+    directly (see codex_to_chromadb.py's COLLECTION_NAME).
 """
 
 import os
@@ -75,8 +88,13 @@ def _bridge_query(sql: str, params: Optional[list] = None) -> list[dict]:
 # ── Query tokenisation ─────────────────────────────────────────────────────────
 
 def _tokenise(text: str) -> list[str]:
-    """Lowercase, split on non-alpha, remove stop words and short tokens."""
-    tokens = re.findall(r"[a-z]+", text.lower())
+    """Lowercase, split on non-alphanumeric, remove stop words and short tokens.
+
+    Was `[a-z]+`, which silently dropped every digit — a query like "RC-505" or
+    "H100" tokenised to "rc" (or nothing useful), so numeric-suffixed product/model
+    names could never match. `[a-z0-9]+` keeps digits attached to their token.
+    """
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
     return [t for t in tokens if len(t) > 2 and t not in STOP_WORDS]
 
 

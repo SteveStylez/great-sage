@@ -7,11 +7,11 @@ Routes each task to the correct execution path based on assigned_to + task type.
 
 Routes:
   efreet   → INSERT into efreet_queue (prompt + style extracted from title/description)
-  veldora  → claude -p execution (caption/draft/content generation)
+  veldora  → local Ollama (qwen3:14b) execution (caption/draft/content generation)
   claude-native / dispatched_to_native → skip (CN handles these)
   orchestrator / manual → skip (GS session handles these)
 
-Marks tasks: dispatched → done (efreet) or done (veldora claude -p output saved)
+Marks tasks: dispatched → done (efreet) or done (veldora Ollama output saved)
 
 LaunchAgent: com.stylez.task-dispatch-bridge
 """
@@ -19,8 +19,6 @@ LaunchAgent: com.stylez.task-dispatch-bridge
 import json
 import os
 import re
-import subprocess
-import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -35,7 +33,6 @@ TG_BOT        = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT       = os.getenv("TG_CHAT_ID", "")
 
 POLL_INTERVAL = 300      # 5 minutes
-CLAUDE_BIN    = "/opt/homebrew/bin/claude"
 OUTPUT_DIR    = Path.home() / "Documents/Creative/Social/GS_Dispatch"
 LOG_PATH      = Path.home() / "Library/Logs/Stylez/task_dispatch_bridge.log"
 
@@ -115,26 +112,60 @@ def extract_efreet_prompt(title: str, description: str) -> str:
     prompt = re.sub(r"(generate|batch \d+-\d+|batch\s+\d+)", "", prompt, flags=re.IGNORECASE).strip()
     return prompt or title
 
+# Per-task dispatch attempt counter (in-process; resets on daemon restart).
+# Bounds retries and backs off instead of hammering the bridge forever.
+_dispatch_attempts: dict = {}
+MAX_DISPATCH_ATTEMPTS = 5
+
 def dispatch_to_efreet(task: dict) -> bool:
+    task_id = task["id"]
     title = task["title"]
     desc  = task.get("description") or ""
     style = extract_efreet_style(title, desc)
     prompt = extract_efreet_prompt(title, desc)
 
-    log(f"Dispatching #{task['id']} to efreet_queue — style={style}, prompt={prompt[:60]}")
+    log(f"Dispatching #{task_id} to efreet_queue — style={style}, prompt={prompt[:60]}")
     try:
-        bridge(
-            "INSERT INTO efreet_queue (prompt, style, status, created_at) VALUES (?, ?, 'pending', datetime('now'))",
+        # Idempotency guard: if a prior attempt inserted the queue row but then failed
+        # before flipping task_priority to 'dispatched', the task stays 'pending' and
+        # gets retried — without this check that would INSERT a duplicate queue row
+        # every cycle forever. Skip the INSERT if a matching pending row already exists.
+        existing = bridge(
+            "SELECT id FROM efreet_queue WHERE prompt=? AND style=? AND status='pending' LIMIT 1",
             [prompt, style]
         )
+        already_queued = bool(existing.get("results"))
+
+        if not already_queued:
+            bridge(
+                "INSERT INTO efreet_queue (prompt, style, status, created_at) VALUES (?, ?, 'pending', datetime('now'))",
+                [prompt, style]
+            )
+
         bridge(
             "UPDATE task_priority SET status='dispatched', result=?, started_at=datetime('now') WHERE id=?",
-            [f"Dispatched to efreet_queue — style={style}", task["id"]]
+            [f"Dispatched to efreet_queue — style={style}", task_id]
         )
-        log(f"#{task['id']} dispatched to efreet_queue OK")
+        _dispatch_attempts.pop(task_id, None)
+        log(f"#{task_id} dispatched to efreet_queue OK")
         return True
     except Exception as e:
-        log(f"#{task['id']} efreet dispatch failed: {e}")
+        attempts = _dispatch_attempts.get(task_id, 0) + 1
+        _dispatch_attempts[task_id] = attempts
+        log(f"#{task_id} efreet dispatch failed (attempt {attempts}/{MAX_DISPATCH_ATTEMPTS}): {e}")
+
+        if attempts >= MAX_DISPATCH_ATTEMPTS:
+            try:
+                bridge(
+                    "UPDATE task_priority SET status='failed', result=? WHERE id=?",
+                    [f"efreet dispatch failed after {attempts} attempts: {str(e)[:150]}", task_id]
+                )
+            except Exception as e2:
+                log(f"#{task_id} could not mark task failed after exhausting retries: {e2}")
+            _dispatch_attempts.pop(task_id, None)
+        else:
+            backoff = min(5 * (2 ** (attempts - 1)), 60)
+            time.sleep(backoff)
         return False
 
 # ── Veldora claude -p execution ───────────────────────────────────────────────
@@ -146,7 +177,12 @@ Gold standard: personal, honest, speaks to someone specific, ends with a quiet C
 
 Brand palette voice: dark, minimal, intentional. No hype language. No "🔥" filler."""
 
-def run_claude_p(prompt: str, timeout: int = 120) -> str:
+class OllamaTimeoutError(RuntimeError):
+    """Raised when the local Ollama call exceeds its timeout — distinct from other
+    failures so callers can escalate to CN instead of just logging a generic error."""
+
+
+def run_ollama_generate(prompt: str, timeout: int = 120) -> str:
     """Generate content via qwen3:14b (Ollama local) — zero Anthropic token cost."""
     import urllib.request, json as _json
     payload = _json.dumps({
@@ -165,6 +201,8 @@ def run_claude_p(prompt: str, timeout: int = 120) -> str:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = _json.loads(resp.read())
             return data.get("response", "").strip()
+    except TimeoutError as e:
+        raise OllamaTimeoutError(f"qwen3:14b call timed out after {timeout}s: {e}") from e
     except Exception as e:
         raise RuntimeError(f"qwen3:14b call failed: {e}")
 
@@ -172,7 +210,7 @@ def dispatch_veldora_content(task: dict) -> bool:
     title = task["title"]
     desc  = task.get("description") or ""
 
-    # Build a specific claude -p prompt
+    # Build a specific Ollama (qwen3:14b) prompt
     prompt = f"""{VELDORA_SYSTEM}
 
 Task: {title}
@@ -181,7 +219,7 @@ Task: {title}
 Execute this task fully. Produce the final output — captions, copy, or schedule as required.
 Write in Steve's voice. Be specific to ADITL / SoH EP context. No meta-commentary, just the deliverable."""
 
-    log(f"Executing #{task['id']} via claude -p — '{title[:60]}'")
+    log(f"Executing #{task['id']} via local Ollama (qwen3:14b) — '{title[:60]}'")
 
     # Mark in-progress
     bridge(
@@ -190,7 +228,7 @@ Write in Steve's voice. Be specific to ADITL / SoH EP context. No meta-commentar
     )
 
     try:
-        output = run_claude_p(prompt, timeout=180)
+        output = run_ollama_generate(prompt, timeout=180)
 
         if not output or len(output) < 50:
             raise RuntimeError(f"Output too short ({len(output)} chars) — likely failed")
@@ -209,9 +247,9 @@ Write in Steve's voice. Be specific to ADITL / SoH EP context. No meta-commentar
         tg(f"✅ Veldora task #{task['id']} complete\n{title}\n→ {out_path.name}")
         return True
 
-    except subprocess.TimeoutExpired:
+    except OllamaTimeoutError:
         bridge(
-            "UPDATE task_priority SET status='failed', result='claude -p timeout >180s — escalate to CN' WHERE id=?",
+            "UPDATE task_priority SET status='failed', result='Ollama qwen3:14b timeout >180s — escalate to CN' WHERE id=?",
             [task["id"]]
         )
         log(f"#{task['id']} timeout")
@@ -248,31 +286,37 @@ def route_task(task: dict) -> str:
 # ── System Health Check ──────────────────────────────────────────────────────
 _last_health_alert = {}
 
+def _query_count(sql: str) -> int:
+    """Run a COUNT(*) query and safely extract the count.
+
+    bridge() can return {"results": []} (key present, list empty) as well as a
+    missing "results" key — res.get("results", [{}])[0] only guards the latter and
+    throws IndexError on the former. This guards both.
+    """
+    res = bridge(sql)
+    rows = res.get("results") or []
+    return rows[0].get("cnt", 0) if rows else 0
+
+
 def health_check():
     """Check production systems for 0-output conditions. TG alert if stalled."""
     alerts = []
     try:
-        # Efreet: check if completions are increasing
-        res = bridge("SELECT COUNT(*) as cnt FROM efreet_queue WHERE status='complete'")
-        efreet_complete = res.get("results", [{}])[0].get("cnt", 0)
-        res = bridge("SELECT COUNT(*) as cnt FROM efreet_queue WHERE status='timeout'")
-        efreet_timeout = res.get("results", [{}])[0].get("cnt", 0)
-        res = bridge("SELECT COUNT(*) as cnt FROM efreet_queue WHERE status='processing'")
-        efreet_processing = res.get("results", [{}])[0].get("cnt", 0)
+        # Efreet: stuck/timed-out rows indicate the pipeline has stalled
+        efreet_timeout = _query_count("SELECT COUNT(*) as cnt FROM efreet_queue WHERE status='timeout'")
+        efreet_processing = _query_count("SELECT COUNT(*) as cnt FROM efreet_queue WHERE status='processing'")
         if efreet_processing > 5:
             alerts.append(f"Efreet: {efreet_processing} stuck processing")
         if efreet_timeout > 50:
             alerts.append(f"Efreet: {efreet_timeout} timeouts (check daemon)")
 
         # CN: unfinished conversations
-        res = bridge("SELECT COUNT(*) as cnt FROM the_codex_conversations_native WHERE unfinished=1")
-        cn_unfinished = res.get("results", [{}])[0].get("cnt", 0)
+        cn_unfinished = _query_count("SELECT COUNT(*) as cnt FROM the_codex_conversations_native WHERE unfinished=1")
         if cn_unfinished > 10:
             alerts.append(f"CN: {cn_unfinished} unfinished conversations")
 
         # Tasks: answer_missing
-        res = bridge("SELECT COUNT(*) as cnt FROM task_priority WHERE status='answer_missing'")
-        missing = res.get("results", [{}])[0].get("cnt", 0)
+        missing = _query_count("SELECT COUNT(*) as cnt FROM task_priority WHERE status='answer_missing'")
         if missing > 3:
             alerts.append(f"Tasks: {missing} answer_missing — CN output not ingested")
 

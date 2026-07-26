@@ -35,15 +35,15 @@ import signal
 import sqlite3
 import subprocess
 import plistlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Any, Tuple
 
 # GS_AGENT_BUS_PATCHED
 
 # GS_PUBSUB_PATCHED
 try:
-    from gs_pubsub import Publisher as _Pub, Subscriber as _Sub, E as _E
+    from gs_pubsub import Publisher as _Pub
     _gs_pub = _Pub("gs_health")
     _gs_pub.emit_debug("system.daemon_crash".replace("crash","start"), {"daemon": "gs_health", "status": "starting"})
 except Exception as _pse:
@@ -52,14 +52,33 @@ except Exception as _pse:
 import sys as _gs_bus_sys
 from pathlib import Path as _GSPath
 _gs_bus_sys.path.insert(0, str(_GSPath(__file__).resolve().parent))
+
+# Agent bus: construct the client here (cheap, no I/O), but do NOT register() at
+# import time — register() makes a network call, and importing this module (e.g.
+# for its helper functions) should never have that side effect. Registration is
+# deferred to _ensure_bus_registered(), called lazily once we actually start
+# running a health check.
+_gs_bus = None
+_gs_bus_registered = False
 try:
     from gs_agent_bus import AgentBus as _AgentBus
     _gs_bus = _AgentBus('gs_health')
-    _gs_bus.register(capabilities=['system_health', 'daemon_watch', 'alerting'])
 except Exception as _gs_bus_err:
     _gs_bus = None
     import logging as _gs_log
     _gs_log.getLogger('gs_health').warning(f'agent bus unavailable: {_gs_bus_err}')
+
+
+def _ensure_bus_registered() -> None:
+    """Register on the agent bus on first use, not at import time."""
+    global _gs_bus_registered
+    if _gs_bus is not None and not _gs_bus_registered:
+        try:
+            _gs_bus.register(capabilities=['system_health', 'daemon_watch', 'alerting'])
+        except Exception as e:
+            import logging as _gs_log
+            _gs_log.getLogger('gs_health').warning(f'agent bus register failed: {e}')
+        _gs_bus_registered = True
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -85,8 +104,11 @@ STALE_LOG_HOURS = 6          # log not updated in 6h = stale
 RESTART_LOOP_THRESHOLD = 30  # ThrottleInterval <= 30s with KeepAlive = restart loop risk
 SILENT_LOG_BYTES = 10        # log under 10 bytes = silent failure
 
-# Daemon prefixes we care about
-DAEMON_PREFIXES = ("com.stylez.", "com.greatsage.", "com.stevestylez.")
+# Daemon prefixes we care about. Kept in sync with daemon_watchdog.py's PREFIXES —
+# the two health layers previously watched different fleets (this one was missing
+# com.rise., daemon_watchdog was missing com.greatsage.), so a daemon under either
+# missing prefix was invisible to one of the two monitors. Union of both.
+DAEMON_PREFIXES = ("com.stylez.", "com.greatsage.", "com.stevestylez.", "com.rise.")
 
 # Known retired daemons (don't flag these)
 RETIRED_DAEMONS = {
@@ -239,18 +261,26 @@ def check_process(daemon: Dict[str, Any]) -> Dict[str, Any]:
     script = daemon["script"]
     label = daemon["label"]
 
-    # Try launchctl list first
+    # Try launchctl list first. `launchctl list` output is tab-separated
+    # "PID\tExitStatus\tLabel" — split on tabs and compare the label field for an
+    # EXACT match, mirroring daemon_watchdog.py. The previous `if label in line`
+    # substring check could match the wrong daemon (e.g. label "gs_health" would
+    # also match a line for "com.stylez.gs_health_v2").
     try:
         result = subprocess.run(
             ["launchctl", "list"],
             capture_output=True, text=True, timeout=5,
         )
-        for line in result.stdout.splitlines():
-            if label in line:
-                parts = line.split()
-                pid = int(parts[0]) if parts[0] != "-" else 0
-                exit_code = int(parts[1]) if len(parts) > 1 else -1
-                return {"running": pid > 0, "pid": pid, "exit_code": exit_code}
+        for line in result.stdout.strip().splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            pid_str, exit_str, line_label = parts
+            if line_label != label:
+                continue
+            pid = int(pid_str) if pid_str != "-" else 0
+            exit_code = int(exit_str) if exit_str != "-" else -1
+            return {"running": pid > 0, "pid": pid, "exit_code": exit_code}
     except Exception:
         pass
 
@@ -346,9 +376,13 @@ DISABLED = "DISABLED"
 
 
 def classify_health(daemon: Dict, process: Dict, log_info: Dict) -> Tuple[str, str]:
-    """Classify daemon health and generate recommendation."""
+    """Classify daemon health and generate recommendation.
 
-    label = daemon["label"]
+    log_info is the already-computed primary log analysis (see run_health_check),
+    passed in so it is not re-derived here. Previously this function ignored
+    log_info and called analyze_log() again on both stdout/stderr paths, doubling
+    the file I/O for every daemon on every check for no reason.
+    """
 
     # Disabled
     if daemon.get("disabled"):
@@ -360,12 +394,8 @@ def classify_health(daemon: Dict, process: Dict, log_info: Dict) -> Tuple[str, s
             return RESTART_LOOP, "KeepAlive is true but process is not running — likely crash-looping"
         return DEAD, f"Process not running (exit code: {process['exit_code']})"
 
-    # Running but check output quality
-    stdout_log = analyze_log(daemon["stdout_log"])
-    stderr_log = analyze_log(daemon["stderr_log"])
-
-    # Use the best available log
-    primary_log = stdout_log if stdout_log["exists"] else stderr_log
+    # Running but check output quality — use the caller-supplied analysis.
+    primary_log = log_info
 
     # Silent failure — running but 0 output
     if not primary_log["exists"] or primary_log["size_bytes"] <= SILENT_LOG_BYTES:
@@ -397,6 +427,7 @@ def classify_health(daemon: Dict, process: Dict, log_info: Dict) -> Tuple[str, s
 
 def run_health_check(output_json: bool = False) -> List[Dict[str, Any]]:
     """Run a full health check on all daemons."""
+    _ensure_bus_registered()
     ensure_tables()
     daemons = scan_plists()
     results = []
@@ -650,11 +681,13 @@ def _tg_alert(msg: str) -> None:
     env_file = os.path.expanduser("~/Library/Stylez/.env")
     tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat = os.environ.get("TELEGRAM_CHAT_ID", "")
-    if not tok and os.path.exists(env_file):
+    if (not tok or not chat) and os.path.exists(env_file):
         for line in open(env_file):
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
+            if not tok and line.startswith("TELEGRAM_BOT_TOKEN="):
                 tok = line.strip().split("=", 1)[1].strip('"\'')
-    if not tok:
+            elif not chat and line.startswith("TELEGRAM_CHAT_ID="):
+                chat = line.strip().split("=", 1)[1].strip('"\'')
+    if not tok or not chat:
         return
     try:
         subprocess.run(

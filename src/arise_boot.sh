@@ -59,11 +59,21 @@ try:
                 print(tty)
 except: pass
 " 2>/dev/null | while read TTY_NAME; do
-  # Find and kill the matching ttyd-spawned Claude session
-  TTY_PID=$(ps aux | grep -i "claude.*$TTY_NAME" | grep -v grep | awk '{print $2}')
-  if [ -n "$TTY_PID" ]; then
-    kill "$TTY_PID" 2>/dev/null
-    echo "  [SIGNAL] Killed completed session $TTY_NAME (PID $TTY_PID)"
+  # Find and kill the matching ttyd-spawned Claude session.
+  # SECURITY: TTY_NAME comes from a D1 row (directives table) reachable by anyone
+  # holding the shared bridge key. The old `ps aux | grep -i "claude.*$TTY_NAME"`
+  # (a) fed TTY_NAME straight into an unescaped grep -E pattern, so a value like
+  # "ttyd.*" or "." could match/kill unrelated processes, and (b) captured every
+  # matching PID into one unquoted variable, so `kill "$TTY_PID"` broke if more
+  # than one process matched. Escape the pattern for literal matching and kill
+  # every exact match individually.
+  ESCAPED_TTY=$(python3 -c "import re,sys; print(re.escape(sys.argv[1]))" "$TTY_NAME" 2>/dev/null)
+  if [ -n "$ESCAPED_TTY" ]; then
+    TTY_PIDS=$(pgrep -f "claude.*${ESCAPED_TTY}" 2>/dev/null)
+    for TTY_PID in $TTY_PIDS; do
+      kill "$TTY_PID" 2>/dev/null
+      echo "  [SIGNAL] Killed completed session $TTY_NAME (PID $TTY_PID)"
+    done
   fi
   # Delete the signal key from D1
   query_d1 "DELETE FROM directives WHERE key='session_done_$TTY_NAME'" >/dev/null 2>&1
@@ -80,11 +90,16 @@ if [ -f "$SHION_ACADEMIC" ]; then
   echo "--- SHION ACADEMIC BRIEFING ---"
   python3 -c "
 import json, datetime
+from zoneinfo import ZoneInfo
+
+PACIFIC = ZoneInfo('America/Los_Angeles')
 
 with open('$SHION_ACADEMIC') as f:
     data = json.load(f)
 
-now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-7)))
+# Use the IANA zone (handles PDT/PST DST transitions) instead of a hardcoded
+# UTC-7 offset, which silently became wrong-by-an-hour every winter (PST=UTC-8).
+now = datetime.datetime.now(PACIFIC)
 print(f'  Source: {data.get(\"source\",\"unknown\")} | Updated: {data.get(\"last_updated\",\"?\")}')
 print()
 
@@ -95,7 +110,7 @@ for a in data.get('assignments', []):
         continue
     try:
         raw_due = a['due'].replace('Z', '+00:00')
-        due = datetime.datetime.fromisoformat(raw_due).astimezone(datetime.timezone(datetime.timedelta(hours=-7)))
+        due = datetime.datetime.fromisoformat(raw_due).astimezone(PACIFIC)
         hours = (due - now).total_seconds() / 3600
         if hours < 0:
             continue

@@ -13,6 +13,14 @@ This is the ACTUAL embedding pipeline. Previous attempts either:
 
 This script fixes all of that by going straight to ChromaDB.
 
+NOTE — this is one of two independent retrieval paths:
+  This script builds the SEMANTIC (vector/embedding) side of Codex retrieval —
+  the "gs_codex" ChromaDB collection, queryable for conceptual/meaning-based
+  recall. codex_retrieval.py is a SEPARATE keyword/LIKE-based retriever that
+  queries D1's the_codex_conversations table directly and never touches this
+  collection. The two are alternative retrieval strategies, not stages of one
+  pipeline — pick based on whether the query needs exact-term or semantic recall.
+
 Usage:
   python3 codex_to_chromadb.py                    # embed everything
   python3 codex_to_chromadb.py --dry-run           # show what would be embedded
@@ -22,7 +30,6 @@ Usage:
 """
 
 import os
-import sys
 import json
 import time
 import sqlite3
@@ -295,14 +302,33 @@ def index_to_chromadb(records, dry_run=False, batch_size=BATCH_SIZE):
             existing_ids.update(batch["ids"])
     log(f"Found {len(existing_ids)} already-indexed chunks")
 
-    # Prepare all chunks
+    # Prepare all chunks.
+    #
+    # Chunk IDs embed a content hash (see the f-string below), so if a source
+    # record's text changes, its OLD chunk IDs never reappear here and never get
+    # cleaned up — they'd sit in ChromaDB forever as stale/orphaned chunks that no
+    # longer match the current source. Fix: for each record, compute the CURRENT
+    # set of chunk IDs first. If any of them is not already indexed, treat the
+    # whole record as new-or-changed — purge whatever chunks are currently indexed
+    # under that (source_type, record_id) before re-adding the fresh set. This
+    # makes re-indexing a changed record a true upsert instead of an append, while
+    # unchanged records (all current chunk IDs already present) are skipped
+    # entirely, preserving the original incremental/low-cost behavior.
     all_chunks = []
+    records_to_purge = set()  # (source_type, record_id) needing old chunks deleted first
+
     for record in records:
         chunks = chunk_text(record["text"])
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{record['id']}_chunk{i}_{hashlib.md5(chunk[:100].encode()).hexdigest()[:8]}"
-            if chunk_id in existing_ids:
-                continue
+        record_chunk_specs = [
+            (i, chunk, f"{record['id']}_chunk{i}_{hashlib.md5(chunk[:100].encode()).hexdigest()[:8]}")
+            for i, chunk in enumerate(chunks)
+        ]
+
+        if all(chunk_id in existing_ids for _, _, chunk_id in record_chunk_specs):
+            continue  # unchanged — nothing to do
+
+        records_to_purge.add((record["source_type"], record["record_id"]))
+        for i, chunk, chunk_id in record_chunk_specs:
             all_chunks.append({
                 "id": chunk_id,
                 "text": chunk,
@@ -315,13 +341,14 @@ def index_to_chromadb(records, dry_run=False, batch_size=BATCH_SIZE):
                 },
             })
 
-    log(f"Total new chunks to embed: {len(all_chunks)}")
+    log(f"Records needing (re)index: {len(records_to_purge)}")
+    log(f"Total new/changed chunks to embed: {len(all_chunks)}")
 
     if dry_run:
         total_chars = sum(len(c["text"]) for c in all_chunks)
         est_tokens = total_chars // 4
         est_cost = (est_tokens / 1_000_000) * 0.02
-        log(f"[DRY RUN] Would embed {len(all_chunks)} chunks")
+        log(f"[DRY RUN] Would embed {len(all_chunks)} chunks across {len(records_to_purge)} changed/new records")
         log(f"[DRY RUN] Total chars: {total_chars:,} | Est tokens: {est_tokens:,}")
         log(f"[DRY RUN] Est cost: ${est_cost:.4f} (text-embedding-3-small @ $0.02/1M tokens)")
         return 0
@@ -329,6 +356,19 @@ def index_to_chromadb(records, dry_run=False, batch_size=BATCH_SIZE):
     if not all_chunks:
         log("Nothing new to embed")
         return 0
+
+    # Purge stale chunks for every record we're about to re-add, so a changed
+    # record's old (now-orphaned) chunks don't linger alongside its new ones.
+    for source_type, record_id in records_to_purge:
+        try:
+            collection.delete(where={
+                "$and": [
+                    {"source_type": source_type},
+                    {"record_id": record_id},
+                ]
+            })
+        except Exception as e:
+            log(f"Purge-before-reindex failed for {source_type}:{record_id}: {e}", "WARN")
 
     # Process in batches
     total_embedded = 0

@@ -15,13 +15,13 @@ import os
 import plistlib
 import re
 import subprocess
-import sys
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 
 LAUNCH_AGENTS_DIR = os.path.expanduser("~/Library/LaunchAgents")
 REPORT_PATH = os.path.expanduser("~/workspace/reports/daemon_watchdog_report.md")
-PREFIXES = ("com.stylez.", "com.stevestylez.", "com.rise.")
+# Kept in sync with gs_health_monitor.py's DAEMON_PREFIXES — union of both fleets so
+# neither monitor is blind to daemons the other one covers.
+PREFIXES = ("com.stylez.", "com.stevestylez.", "com.rise.", "com.greatsage.")
 
 
 def parse_plists():
@@ -305,7 +305,7 @@ def render_full_report(rows):
     """Render markdown report."""
     now = datetime.now()
     lines = []
-    lines.append(f"# Daemon Watchdog Report")
+    lines.append("# Daemon Watchdog Report")
     lines.append(f"Generated: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
 
@@ -317,7 +317,7 @@ def render_full_report(rows):
     stopped = sum(1 for r in rows if r["pid"] == "-")
     total = len(rows)
 
-    lines.append(f"## Summary")
+    lines.append("## Summary")
     lines.append(f"- Total daemons scanned: {total}")
     lines.append(f"- Running: {running} | Stopped: {stopped}")
     lines.append(f"- CRITICAL: {critical} | HIGH: {high} | MEDIUM: {medium}")

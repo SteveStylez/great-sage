@@ -24,13 +24,12 @@ Author: Great Sage / Steve Whiting
 import os
 import json
 import uuid
-import time
 import sqlite3
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Config
@@ -40,12 +39,16 @@ HOME = Path.home()
 LOG_DIR = HOME / "Library" / "Stylez" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    filename=str(LOG_DIR / "gs_agent_bus.log"),
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-)
+# Use a module-scoped logger with its own handler instead of logging.basicConfig(),
+# which configures the ROOT logger — any other module importing gs_agent_bus would
+# silently have its own logging output redirected into gs_agent_bus.log too.
 log = logging.getLogger("gs_agent_bus")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _handler = logging.FileHandler(str(LOG_DIR / "gs_agent_bus.log"))
+    _handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"))
+    log.addHandler(_handler)
+    log.propagate = False
 
 BRIDGE_URL = os.getenv(
     "GS_BRIDGE_URL", "https://your-bridge.example.workers.dev/query"
@@ -160,6 +163,19 @@ class AgentBus:
         self.agent_id = agent_id
         self._use_bridge = bool(BRIDGE_KEY)
 
+    def _call_bridge(self, sql: str, params: list = None) -> Optional[list]:
+        """Instance-level bridge call that respects self._use_bridge.
+
+        Previously self._use_bridge was computed but never read — every instance
+        method called the module-level _bridge() unconditionally, meaning a daemon
+        with no BRIDGE_KEY configured still attempted (and waited out the timeout
+        on) a network call every single time before falling back to local SQLite.
+        This short-circuits straight to local mode when no key is configured.
+        """
+        if not self._use_bridge:
+            return None
+        return _bridge(sql, params)
+
     # ------------------------------------------------------------------ #
     # Registration                                                          #
     # ------------------------------------------------------------------ #
@@ -184,7 +200,7 @@ class AgentBus:
         """
         params = [self.agent_id, self.agent_id, caps, now, meta_str]
 
-        result = _bridge(sql, params)
+        result = self._call_bridge(sql, params)
         if result is not None:
             log.info("[%s] registered on bridge (caps=%s)", self.agent_id, caps)
             return True
@@ -205,7 +221,7 @@ class AgentBus:
         """Lightweight heartbeat — just updates last_heartbeat. Call in daemon loop."""
         now = datetime.now(timezone.utc).isoformat()
         sql = "UPDATE gs_agent_registry SET last_heartbeat=?, status='active' WHERE agent_id=?"
-        result = _bridge(sql, [now, self.agent_id])
+        result = self._call_bridge(sql, [now, self.agent_id])
         if result is not None:
             return True
         try:
@@ -245,7 +261,7 @@ class AgentBus:
             """
             params = []
 
-        rows = _bridge(sql, params)
+        rows = self._call_bridge(sql, params)
         if rows is not None:
             return rows
 
@@ -296,7 +312,7 @@ class AgentBus:
             capability or "", payload_str, now, expires,
         ]
 
-        result = _bridge(sql, params)
+        result = self._call_bridge(sql, params)
         if result is not None:
             log.info(
                 "[%s] → [%s] type=%s thread=%s",
@@ -339,7 +355,7 @@ class AgentBus:
         params = [self.agent_id, now, str(limit)]
 
         from_local = False
-        rows = _bridge(sql, params)
+        rows = self._call_bridge(sql, params)
         if rows is None:
             from_local = True
             try:
@@ -373,7 +389,7 @@ class AgentBus:
             except Exception as e:
                 log.warning("[%s] local mark-delivered failed: %s", self.agent_id, e)
         else:
-            _bridge(
+            self._call_bridge(
                 f"UPDATE gs_agent_messages SET status='delivered', delivered_at=? WHERE id IN ({placeholders})",
                 [now, *ids],
             )
@@ -398,7 +414,7 @@ class AgentBus:
             WHERE id=?
         """
         params = [json.dumps(reply_payload), str(msg_id)]
-        result = _bridge(sql, params)
+        result = self._call_bridge(sql, params)
         return result is not None
 
     def get_thread(self, thread_id: str) -> list:
@@ -410,7 +426,7 @@ class AgentBus:
             WHERE thread_id=?
             ORDER BY id ASC
         """
-        rows = _bridge(sql, [thread_id])
+        rows = self._call_bridge(sql, [thread_id])
         if rows is None:
             return []
         for r in rows:
@@ -447,7 +463,7 @@ class AgentBus:
             proposal_id, self.agent_id, target_file,
             change_type, description, diff,
         ]
-        _bridge(sql, params)
+        self._call_bridge(sql, params)
         log.info(
             "[%s] proposal submitted: %s → %s",
             self.agent_id, proposal_id[:8], target_file,
